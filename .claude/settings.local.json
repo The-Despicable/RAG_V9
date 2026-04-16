@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp .env.example .env)",
+      "Bash(docker compose:*)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(docker rm:*)",
+      "Bash(python -m py_compile main.py)",
+      "Bash(docker-compose ps:*)"
+    ]
+  }
+}
