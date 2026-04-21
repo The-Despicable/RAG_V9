@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     RATE_LIMIT_WINDOW_SECONDS: int = 60
     RATE_LIMIT_BY_IP: bool = False
 
+    MAX_REQUEST_SIZE_MB: int = 10
+    MAX_CONTENT_LENGTH: int = 10485760
+
     CORS_ALLOW_CREDENTIALS: bool = True
     CORS_ALLOW_METHODS: str = '["GET", "POST", "PUT", "DELETE", "OPTIONS"]'
     CORS_ALLOW_HEADERS: str = '["*"]'

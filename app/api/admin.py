@@ -6,10 +6,12 @@ from fastapi import APIRouter, Depends, Response
 from fastapi.responses import JSONResponse
 import httpx
 
-from app.main import db_pool, redis_client, pc
+from app.main import db_pool, redis_client
 from app.config import get_settings
+from app.core.security import get_current_user
 from app.middleware.request_id import get_request_id
 from app.utils.metrics import metrics
+from app.services.pinecone import pinecone_service
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 settings = get_settings()
@@ -33,7 +35,7 @@ async def health_check():
         checks["redis"] = f"error: {str(e)}"
     
     try:
-        pc.Index(settings.PINECONE_INDEX).describe_index_stats()
+        await pinecone_service.describe_stats()
         checks["pinecone"] = "ok"
     except Exception as e:
         checks["pinecone"] = f"error: {str(e)}"
@@ -76,7 +78,7 @@ async def get_metrics():
 
 
 @router.get("/dashboard")
-async def get_dashboard(user: dict = Depends(lambda: {"workspace_id": "test"})):
+async def get_dashboard(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         active_users_24h = await conn.fetchval(
             "SELECT COUNT(DISTINCT workspace_id) FROM query_logs WHERE created_at > NOW() - INTERVAL '24 hours'"

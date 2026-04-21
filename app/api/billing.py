@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from pydantic import BaseModel, Field
 
 from app.main import db_pool
+from app.core.security import get_current_user
 from app.config import get_settings
 from app.middleware.request_id import get_request_id
 from app.middleware.logging import logger
@@ -31,7 +32,7 @@ PLAN_PRICES = {
 
 
 @router.get("/usage")
-async def get_usage(user: dict = Depends(lambda: {"workspace_id": "test"})):
+async def get_usage(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         sub = await conn.fetchrow(
             """SELECT plan, tokens_balance, tokens_limit_monthly, renewal_date
@@ -86,7 +87,7 @@ async def get_usage(user: dict = Depends(lambda: {"workspace_id": "test"})):
 
 @router.get("/usage/history")
 async def get_usage_history(
-    user: dict = Depends(lambda: {"workspace_id": "test"}),
+    user: dict = Depends(get_current_user),
     days: int = Query(30, ge=1, le=90),
     granularity: str = Query("daily", regex="^(hourly|daily|weekly)$")
 ):
@@ -125,7 +126,7 @@ async def get_usage_history(
 
 
 @router.post("/upgrade")
-async def upgrade_plan(request: UpgradeRequest, user: dict = Depends(lambda: {"workspace_id": "test"})):
+async def upgrade_plan(request: UpgradeRequest, user: dict = Depends(get_current_user)):
     amount = PLAN_PRICES.get(request.plan)
     if not amount:
         raise HTTPException(
@@ -217,7 +218,7 @@ async def razorpay_webhook(request: Request):
 
 
 @router.get("/subscription")
-async def get_subscription(user: dict = Depends(lambda: {"workspace_id": "test"})):
+async def get_subscription(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         sub = await conn.fetchrow(
             """SELECT plan, tokens_balance, tokens_limit_monthly, renewal_date, 

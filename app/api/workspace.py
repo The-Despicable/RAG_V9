@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, EmailStr
 
 from app.main import db_pool
+from app.core.security import get_current_user
 from app.config import get_settings
 from app.middleware.request_id import get_request_id
 
@@ -23,7 +24,7 @@ class InviteMemberRequest(BaseModel):
 
 
 @router.get("")
-async def get_workspace(user: dict = Depends(lambda: {"workspace_id": "test", "email": "test@test.com"})):
+async def get_workspace(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         ws = await conn.fetchrow(
             "SELECT id, name, created_at FROM workspaces WHERE id = $1",
@@ -74,7 +75,7 @@ async def get_workspace(user: dict = Depends(lambda: {"workspace_id": "test", "e
 
 
 @router.put("")
-async def update_workspace(request: WorkspaceUpdateRequest, user: dict = Depends(lambda: {"workspace_id": "test"})):
+async def update_workspace(request: WorkspaceUpdateRequest, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         if request.name:
             await conn.execute(
@@ -86,7 +87,7 @@ async def update_workspace(request: WorkspaceUpdateRequest, user: dict = Depends
 
 
 @router.post("/members")
-async def invite_member(request: InviteMemberRequest, user: dict = Depends(lambda: {"workspace_id": "test", "email": "owner@test.com"})):
+async def invite_member(request: InviteMemberRequest, user: dict = Depends(get_current_user)):
     invitation_id = str(uuid.uuid4())
     expires_at = datetime.utcnow() + timedelta(days=7)
     
@@ -116,7 +117,7 @@ async def invite_member(request: InviteMemberRequest, user: dict = Depends(lambd
 
 
 @router.delete("/members/{member_id}")
-async def remove_member(member_id: str, user: dict = Depends(lambda: {"workspace_id": "test", "email": "owner@test.com"})):
+async def remove_member(member_id: str, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         member = await conn.fetchrow(
             "SELECT id, is_admin FROM users WHERE id = $1 AND workspace_id = $2",

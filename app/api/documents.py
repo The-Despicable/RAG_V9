@@ -10,12 +10,15 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from pydantic import BaseModel, Field
 from fastapi.responses import Response
 
-from app.main import db_pool, redis_client, pc, rebuild_bm25_for_workspace, process_document_async
+from app.main import db_pool, redis_client, rebuild_bm25_for_workspace
+from app.core.security import get_current_user
 from app.config import get_settings
 from app.middleware.request_id import get_request_id
 from app.middleware.logging import logger, log_event
 from app.ingestion import is_supported_type, get_file_extension
 from app.utils.metrics import metrics
+from app.services.pinecone import pinecone_service
+from app.workers.tasks import process_document
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 settings = get_settings()
@@ -53,7 +56,7 @@ class DocumentDetailResponse(BaseModel):
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    user: dict = Depends(lambda: {"user_id": "test", "workspace_id": "test"})
+    user: dict = Depends(get_current_user)
 ):
     await log_event("DOC_UPLOAD", user["user_id"], f"filename={file.filename}")
     
@@ -93,7 +96,10 @@ async def upload_document(
         tmp.write(await file.read())
         tmp_path = tmp.name
     
-    background_tasks.add_task(process_document_async, tmp_path, file.filename, user["workspace_id"], document_id)
+    task = process_document.apply_async(
+        args=[tmp_path, file.filename, user["workspace_id"], document_id],
+        task_id=document_id
+    )
     
     metrics.document_processing.labels(status='queued').inc()
     
@@ -103,6 +109,7 @@ async def upload_document(
             "document_id": document_id,
             "filename": file.filename,
             "status": "uploading",
+            "task_id": task.id,
             "created_at": datetime.utcnow().isoformat() + "Z"
         },
         "request_id": get_request_id()
@@ -111,7 +118,7 @@ async def upload_document(
 
 @router.get("")
 async def list_documents(
-    user: dict = Depends(lambda: {"workspace_id": "test"}),
+    user: dict = Depends(get_current_user),
     status_filter: Optional[str] = Query(None, alias="status"),
     sort: str = Query("created_at", regex="^(created_at|filename)$"),
     order: str = Query("desc", regex="^(asc|desc)$"),
@@ -182,7 +189,7 @@ async def list_documents(
 
 
 @router.get("/{document_id}")
-async def get_document(document_id: str, user: dict = Depends(lambda: {"workspace_id": "test"})):
+async def get_document(document_id: str, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         doc = await conn.fetchrow(
             """SELECT d.id, d.filename, d.status, d.mime_type, d.file_size_bytes, d.created_at, d.processed_at, d.error_message,
@@ -232,7 +239,7 @@ async def get_document(document_id: str, user: dict = Depends(lambda: {"workspac
 
 
 @router.delete("/{document_id}")
-async def delete_document(document_id: str, user: dict = Depends(lambda: {"user_id": "test", "workspace_id": "test"})):
+async def delete_document(document_id: str, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         doc = await conn.fetchrow(
             "SELECT id FROM documents WHERE id = $1 AND workspace_id = $2",
@@ -249,7 +256,7 @@ async def delete_document(document_id: str, user: dict = Depends(lambda: {"user_
         await conn.execute("DELETE FROM documents WHERE id = $1", document_id)
     
     try:
-        pc.Index(settings.PINECONE_INDEX).delete(
+        await pinecone_service.delete(
             filter={"document_id": document_id},
             namespace=f"ws_{user['workspace_id']}"
         )
@@ -270,7 +277,7 @@ async def delete_document(document_id: str, user: dict = Depends(lambda: {"user_
 
 
 @router.get("/{document_id}/preview")
-async def get_document_preview(document_id: str, user: dict = Depends(lambda: {"workspace_id": "test"})):
+async def get_document_preview(document_id: str, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         doc = await conn.fetchrow(
             "SELECT filename, mime_type FROM documents WHERE id = $1 AND workspace_id = $2",

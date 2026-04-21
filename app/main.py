@@ -33,7 +33,10 @@ from app.providers.router import provider_stream, get_embedding
 from app.middleware.request_id import RequestIDMiddleware, get_request_id
 from app.middleware.error_handler import ErrorHandlerMiddleware
 from app.middleware.logging import logger, log_event
+from app.middleware.security import SecurityHeadersMiddleware
 from app.utils.metrics import metrics
+from app.services.pinecone import pinecone_service
+from app.services.reranker import rerank_chunks as do_rerank
 from app.ingestion import (
     extract_text_from_file, extract_images_from_pdf, describe_image,
     transcribe_audio, get_file_extension, is_supported_type,
@@ -277,6 +280,33 @@ async def init_db():
         )
     """)
     
+    await db_pool.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    await db_pool.execute("CREATE INDEX IF NOT EXISTS idx_conversations_workspace ON conversations(workspace_id)")
+    await db_pool.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id)")
+    
+    await db_pool.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            token_count INT DEFAULT 0,
+            metadata JSONB,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    await db_pool.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)")
+    
     if settings.PINECONE_INDEX not in pc.list_indexes().names():
         pc.create_index(
             name=settings.PINECONE_INDEX,
@@ -426,14 +456,12 @@ async def dense_search(query: str, workspace_id: str, doc_ids: List[str], top_k:
     emb = await get_embedding(query)
     namespace = f"ws_{workspace_id}"
     filter_dict = {"document_id": {"$in": doc_ids}} if doc_ids else {}
-    resp = pc.Index(settings.PINECONE_INDEX).query(
+    return await pinecone_service.query(
         namespace=namespace,
         vector=emb,
         top_k=top_k,
-        include_metadata=True,
         filter=filter_dict
     )
-    return [(m.metadata["chunk_id"], m.score) for m in resp.matches if m.metadata.get("chunk_id")]
 
 
 async def sparse_search(query: str, workspace_id: str, doc_ids: List[str], top_k: int) -> List[Tuple[str, float]]:
@@ -476,7 +504,9 @@ def rrf_fusion(dense: List[Tuple[str, float]], sparse: List[Tuple[str, float]], 
 
 
 async def rerank_chunks(query: str, chunk_ids: List[str], workspace_id: str) -> List[Tuple[str, float]]:
-    return [(cid, 1.0) for cid in chunk_ids]
+    bm25_data = await get_bm25_for_workspace(workspace_id)
+    text_map = bm25_data[1] if bm25_data else {}
+    return await do_rerank(query, chunk_ids, workspace_id, text_map)
 
 
 async def hybrid_search(query: str, workspace_id: str, doc_ids: List[str]) -> List[Dict]:
@@ -571,9 +601,7 @@ async def process_document_async(file_path: str, filename: str, workspace_id: st
             for i, chunk_id in enumerate(chunk_ids):
                 vectors.append({"id": chunk_id, "values": embeddings[i], "metadata": {"chunk_id": chunk_id, "document_id": document_id, "text": all_chunks[i][:500]}})
             
-            index = pc.Index(settings.PINECONE_INDEX)
-            for i in range(0, len(vectors), 100):
-                index.upsert(vectors=vectors[i:i+100], namespace=namespace)
+            await pinecone_service.upsert(vectors=vectors, namespace=namespace)
         
         await rebuild_bm25_for_workspace(workspace_id)
         
@@ -616,18 +644,27 @@ async def lifespan(app: FastAPI):
     await redis_client.close()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="RAG V9 API",
+    version="1.0.0",
+    description="Production RAG Backend API",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    lifespan=lifespan
+)
 
 app.add_middleware(ErrorHandlerMiddleware)
 app.add_middleware(RequestIDMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=[settings.FRONTEND_URL], allow_methods=["*"], allow_headers=["*"])
 
-app.include_router(auth.router)
-app.include_router(documents.router)
-app.include_router(chat.router)
-app.include_router(billing.router)
-app.include_router(workspace.router)
-app.include_router(admin.router)
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(documents.router, prefix="/api/v1")
+app.include_router(chat.router, prefix="/api/v1")
+app.include_router(billing.router, prefix="/api/v1")
+app.include_router(workspace.router, prefix="/api/v1")
+app.include_router(admin.router, prefix="/api/v1")
 
 
 @app.middleware("http")
@@ -785,7 +822,7 @@ async def list_documents(user: dict = Depends(get_current_user)):
 async def delete_document(document_id: str, user: dict = Depends(get_current_user)):
     await db_pool.execute("DELETE FROM chunks WHERE document_id = $1", document_id)
     await db_pool.execute("DELETE FROM documents WHERE id = $1 AND workspace_id = $2", document_id, user["workspace_id"])
-    pc.Index(settings.PINECONE_INDEX).delete(filter={"document_id": document_id}, namespace=f"ws_{user['workspace_id']}")
+    await pinecone_service.delete(filter={"document_id": document_id}, namespace=f"ws_{user['workspace_id']}")
     await rebuild_bm25_for_workspace(user["workspace_id"])
     await log_event("DOC_DELETE", user["user_id"], f"document_id={document_id}")
     return {"success": True, "data": {"status": "deleted"}, "request_id": get_request_id()}
@@ -867,7 +904,7 @@ async def health():
         checks["redis"] = f"error: {str(e)}"
     
     try:
-        pc.Index(settings.PINECONE_INDEX).describe_index_stats()
+        await pinecone_service.describe_stats()
         checks["pinecone"] = "ok"
     except Exception as e:
         checks["pinecone"] = f"error: {str(e)}"
@@ -893,6 +930,30 @@ async def health():
     )
 
 
+@app.get("/api/v1/health")
+async def health_v1():
+    return await health()
+
+
+@app.get("/api/v1")
+async def api_root():
+    return {
+        "service": "RAG V9 API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "auth": "/api/v1/auth",
+            "documents": "/api/v1/documents",
+            "chat": "/api/v1/chat",
+            "billing": "/api/v1/billing",
+            "workspace": "/api/v1/workspace",
+            "admin": "/api/v1/admin"
+        },
+        "docs": "/docs",
+        "health": "/api/v1/health"
+    }
+
+
 @app.get("/health/ready")
 async def readiness():
     try:
@@ -905,13 +966,15 @@ async def readiness():
 
 
 @app.get("/")
-async def frontend():
-    return HTMLResponse("""
+async def root():
+    if settings.ENVIRONMENT == "development":
+        return HTMLResponse("""
 <!DOCTYPE html>
 <html>
-<head><title>RAG MVP Alpha</title><style>body{font-family:monospace;max-width:800px;margin:40px auto;padding:20px}textarea{width:100%;height:100px}#response{background:#f5f5f5;padding:10px;border-radius:5px}</style></head>
+<head><title>RAG V9 - Dev Mode</title><style>body{font-family:monospace;max-width:800px;margin:40px auto;padding:20px}textarea{width:100%;height:100px}#response{background:#f5f5f5;padding:10px;border-radius:5px}</style></head>
 <body>
-<h1>RAG MVP Alpha</h1>
+<h1>RAG V9 - Dev Mode</h1>
+<p>API is running. Use /docs for API documentation.</p>
 <div><input type="email" id="email" placeholder="Email"><br><input type="password" id="password" placeholder="Password"><br><input type="text" id="workspace" placeholder="Workspace name"><br><button onclick="register()">Register</button> <button onclick="login()">Login</button></div>
 <hr>
 <div id="app" style="display:none">
@@ -933,7 +996,14 @@ if(token) loadDocs();
 </script>
 </body>
 </html>
-    """)
+        """)
+    return {
+        "service": "RAG V9 API",
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health"
+    }
 
 
 if __name__ == "__main__":

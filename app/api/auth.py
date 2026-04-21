@@ -6,7 +6,7 @@ from pydantic import BaseModel, EmailStr, Field
 import bcrypt
 import jwt
 
-from app.main import db_pool, redis_client
+
 from app.config import get_settings
 from app.middleware.request_id import get_request_id
 from app.middleware.logging import logger, log_event
@@ -37,6 +37,7 @@ class LogoutRequest(BaseModel):
 
 @router.post("/register")
 async def register(data: RegisterRequest):
+    from app.main import db_pool, redis_client  # lazy import
     if len(data.password) < 8:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -117,6 +118,7 @@ async def register(data: RegisterRequest):
 
 @router.post("/login")
 async def login(data: LoginRequest):
+    from app.main import db_pool, redis_client  # lazy import
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, password_hash, workspace_id, email FROM users WHERE email = $1", 
@@ -160,6 +162,7 @@ async def login(data: LoginRequest):
 
 @router.post("/refresh")
 async def refresh(data: RefreshRequest):
+    from app.main import db_pool, redis_client  # lazy import
     user_id = await consume_refresh_token(data.refresh_token)
     if not user_id:
         logger.warning("Refresh token rejected: invalid or reused")
@@ -204,7 +207,8 @@ async def refresh(data: RefreshRequest):
 
 
 @router.post("/logout")
-async def logout(data: LogoutRequest, user: dict = Depends(lambda: {"email": "unknown"})):
+async def logout(data: LogoutRequest):
+    from app.main import redis_client  # lazy import
     if data.refresh_token:
         await redis_client.delete(f"refresh:{data.refresh_token}")
     
